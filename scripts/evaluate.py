@@ -12,12 +12,21 @@ from monai.networks.nets import UNet
 from monai.inferers import sliding_window_inference
 
 
+PATCH_SIZE = 96
+
+
 class TestDataset(Dataset):
     def __init__(self, manifest, data_dir):
         self.data_dir = Path(data_dir)
+
         self.rows = manifest[
             manifest["split"] == "test"
         ].reset_index(drop=True)
+
+        if len(self.rows) != 20:
+            raise ValueError(
+                f"Expected 20 test patients, found {len(self.rows)}"
+            )
 
     def __len__(self):
         return len(self.rows)
@@ -36,10 +45,32 @@ class TestDataset(Dataset):
             folder / f"{patient_id}_label.npy"
         ).astype(np.int64)
 
+        original_shape = label.shape
+
+        _, depth, height, width = image.shape
+
+        pad_d = max(0, PATCH_SIZE - depth)
+        pad_h = max(0, PATCH_SIZE - height)
+        pad_w = max(0, PATCH_SIZE - width)
+
+        if pad_d or pad_h or pad_w:
+            image = np.pad(
+                image,
+                ((0, 0), (0, pad_d), (0, pad_h), (0, pad_w)),
+                mode="constant"
+            )
+
+            label = np.pad(
+                label,
+                ((0, pad_d), (0, pad_h), (0, pad_w)),
+                mode="constant"
+            )
+
         return (
             torch.from_numpy(image).float(),
             torch.from_numpy(label).long(),
-            patient_id
+            patient_id,
+            original_shape
         )
 
 
@@ -97,19 +128,18 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--manifest", required=True)
-    parser.add_argument(
-        "--data-dir", default="data/preprocessed"
-    )
+    parser.add_argument("--data-dir", default="data/preprocessed")
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument(
-        "--model", choices=["A", "B"], required=True
-    )
+    parser.add_argument("--model", choices=["A", "B"], required=True)
     parser.add_argument(
         "--output-dir", default="results/test_evaluation"
     )
     parser.add_argument("--overlap", type=float, default=0.25)
 
     args = parser.parse_args()
+
+    if not 0 <= args.overlap < 1:
+        raise ValueError("Overlap must be between 0 and 1.")
 
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
@@ -144,8 +174,9 @@ def main():
     results = []
 
     with torch.inference_mode():
-        for images, labels, patient_ids in loader:
+        for images, labels, patient_ids, original_shapes in loader:
             patient_id = patient_ids[0]
+            original_shape = original_shapes
 
             start = time.time()
 
@@ -162,6 +193,11 @@ def main():
 
             prediction = outputs.argmax(dim=1)[0]
             target = labels[0]
+
+            d, h, w = original_shape
+
+            prediction = prediction[:d, :h, :w]
+            target = target[:d, :h, :w]
 
             metrics = evaluate_patient(prediction, target)
 
@@ -192,7 +228,9 @@ def main():
     )
 
     metric_columns = [
-        "WT_Dice", "TC_Dice", "Mean_Dice",
+        "WT_Dice",
+        "TC_Dice",
+        "Mean_Dice",
         "inference_time_seconds"
     ]
 

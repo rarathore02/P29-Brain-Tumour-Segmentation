@@ -1,5 +1,6 @@
 
 import argparse
+import random
 import time
 from pathlib import Path
 
@@ -14,17 +15,39 @@ from monai.inferers import sliding_window_inference
 
 SEED = 42
 ROI_SIZE = (96, 96, 96)
-TTA_AXES = (1, 2, 3)
+
+EXPECTED_SPLIT_COUNTS = {
+    "validation": 8,
+    "test": 20
+}
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 class BrainTumourTestDataset(Dataset):
     def __init__(self, manifest, data_dir, split):
         self.data_dir = Path(data_dir)
+
         self.rows = manifest[
             manifest["split"] == split
         ].reset_index(drop=True)
 
         self.split = split
+
+        expected = EXPECTED_SPLIT_COUNTS[split]
+
+        if len(self.rows) != expected:
+            raise ValueError(
+                f"Expected {expected} {split} patients, "
+                f"found {len(self.rows)}"
+            )
 
     def __len__(self):
         return len(self.rows)
@@ -43,19 +66,33 @@ class BrainTumourTestDataset(Dataset):
             folder / f"{patient_id}_label.npy"
         ).astype(np.int64)
 
+        original_shape = label.shape
+
+        _, depth, height, width = image.shape
+
+        pad_d = max(0, ROI_SIZE[0] - depth)
+        pad_h = max(0, ROI_SIZE[1] - height)
+        pad_w = max(0, ROI_SIZE[2] - width)
+
+        if pad_d or pad_h or pad_w:
+            image = np.pad(
+                image,
+                ((0, 0), (0, pad_d), (0, pad_h), (0, pad_w)),
+                mode="constant"
+            )
+
+            label = np.pad(
+                label,
+                ((0, pad_d), (0, pad_h), (0, pad_w)),
+                mode="constant"
+            )
+
         return (
             torch.from_numpy(image).float(),
             torch.from_numpy(label).long(),
-            patient_id
+            patient_id,
+            original_shape
         )
-
-
-def set_seed(seed):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 def build_model():
@@ -105,6 +142,7 @@ def predict_tta(model, image, device, overlap):
     """
     Eight combinations of flipping the three spatial axes.
     Input shape: (1, 4, D, H, W).
+    Returns averaged class probabilities on CPU.
     """
     probability_sum = None
 
@@ -113,7 +151,6 @@ def predict_tta(model, image, device, overlap):
             for flip_w in (False, True):
 
                 transformed = image
-
                 axes = []
 
                 if flip_d:
@@ -147,7 +184,7 @@ def predict_tta(model, image, device, overlap):
                     )
 
                 if probability_sum is None:
-                    probability_sum = probabilities
+                    probability_sum = probabilities.clone()
                 else:
                     probability_sum += probabilities
 
@@ -162,16 +199,23 @@ def main():
         "--data-dir", default="data/preprocessed"
     )
     parser.add_argument("--checkpoint", required=True)
+
     parser.add_argument(
-        "--split", choices=["validation", "test"],
+        "--split",
+        choices=["validation", "test"],
         default="test"
     )
+
     parser.add_argument(
         "--output-dir", default="results/arm_e_test"
     )
+
     parser.add_argument("--overlap", type=float, default=0.5)
 
     args = parser.parse_args()
+
+    if not 0 <= args.overlap < 1:
+        raise ValueError("Overlap must be between 0 and 1.")
 
     set_seed(SEED)
 
@@ -183,6 +227,7 @@ def main():
     print("Inference: 8-way TTA")
     print("Overlap:", args.overlap)
     print("Split:", args.split)
+    print("Random seed:", SEED)
 
     manifest = pd.read_csv(args.manifest)
 
@@ -218,9 +263,9 @@ def main():
     patient_results = []
 
     with torch.inference_mode():
-        for images, labels, patient_ids in loader:
+        for images, labels, patient_ids, original_shapes in loader:
             patient_id = patient_ids[0]
-            target = labels[0]
+            original_shape = original_shapes
 
             start = time.time()
 
@@ -229,6 +274,15 @@ def main():
             )
 
             prediction = probabilities.argmax(dim=1)[0]
+            target = labels[0]
+
+            d, h, w = original_shape
+
+            # Remove padding before saving or calculating metrics.
+            prediction = prediction[:d, :h, :w]
+            target = target[:d, :h, :w]
+
+            probabilities = probabilities[:, :, :d, :h, :w]
 
             elapsed = time.time() - start
 
@@ -236,10 +290,11 @@ def main():
                 prediction, target
             )
 
-            # Predictive entropy, averaged over the 4 classes.
+            # Predictive entropy across the four classes.
+            safe_probabilities = probabilities.clamp_min(1e-8)
+
             entropy = -torch.sum(
-                probabilities.clamp_min(1e-8)
-                * probabilities.clamp_min(1e-8).log(),
+                safe_probabilities * safe_probabilities.log(),
                 dim=1
             )[0]
 
@@ -275,8 +330,12 @@ def main():
     )
 
     summary = results_df[
-        ["WT_Dice", "TC_Dice", "Mean_Dice",
-         "inference_time_seconds"]
+        [
+            "WT_Dice",
+            "TC_Dice",
+            "Mean_Dice",
+            "inference_time_seconds"
+        ]
     ].agg(["mean", "std"]).T
 
     summary.to_csv(

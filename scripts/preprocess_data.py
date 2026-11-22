@@ -1,3 +1,4 @@
+
 import argparse
 from pathlib import Path
 
@@ -9,6 +10,12 @@ from tqdm import tqdm
 
 MODALITIES = ["t1", "t1ce", "t2", "flair"]
 LABEL_MAP = {0: 0, 1: 1, 2: 2, 4: 3}
+
+EXPECTED_SPLIT_COUNTS = {
+    "train": 52,
+    "validation": 8,
+    "test": 20
+}
 
 
 def load_volume(path):
@@ -122,6 +129,19 @@ def main():
 
     manifest = pd.read_csv(manifest_path)
 
+    # Validate the patient split distribution.
+    actual_counts = manifest["split"].value_counts().to_dict()
+
+    if actual_counts != EXPECTED_SPLIT_COUNTS:
+        raise ValueError(
+            f"Unexpected split distribution: {actual_counts}. "
+            f"Expected: {EXPECTED_SPLIT_COUNTS}"
+        )
+
+    # Ensure every patient appears only once.
+    if manifest["patient_id"].duplicated().any():
+        raise ValueError("Duplicate patient IDs found in manifest.")
+
     required_columns = [
         "patient_id", "split", "t1", "t1ce",
         "t2", "flair", "seg"
@@ -137,6 +157,7 @@ def main():
 
     print(f"Patients to preprocess: {len(manifest)}")
     print(f"Output directory: {output_dir}")
+    print(f"Split distribution: {actual_counts}")
 
     summaries = []
 

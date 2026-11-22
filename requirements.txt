@@ -1,1 +1,19 @@
 
+# Core deep learning
+torch==2.11.0
+monai==1.6.2
+
+# Medical image processing
+nibabel
+scipy
+scikit-image
+
+# Data handling
+numpy
+pandas
+
+# Visualisation and utilities
+matplotlib
+tqdm
+scikit-learn
+

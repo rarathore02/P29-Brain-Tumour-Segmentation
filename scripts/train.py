@@ -1,3 +1,4 @@
+
 import argparse
 import random
 import time
@@ -10,13 +11,13 @@ from torch.utils.data import Dataset, DataLoader
 
 from monai.networks.nets import UNet
 from monai.losses import DiceCELoss
+from monai.inferers import sliding_window_inference
 
 
 SEED = 42
 PATCH_SIZE = 96
 BATCH_SIZE = 2
 PATCHES_PER_PATIENT = 2
-EPOCHS = 50
 LEARNING_RATE = 3e-4
 
 
@@ -32,13 +33,12 @@ def set_seed(seed):
 class BrainTumourDataset(Dataset):
     def __init__(self, manifest, data_dir, split, model_type):
         self.data_dir = Path(data_dir)
+        self.split = split
         self.model_type = model_type
 
         self.patients = manifest[
             manifest["split"] == split
         ]["patient_id"].tolist()
-
-        self.split = split
 
     def __len__(self):
         if self.split == "train":
@@ -46,73 +46,71 @@ class BrainTumourDataset(Dataset):
         return len(self.patients)
 
     def load_patient(self, patient_id):
-        image_path = (
-            self.data_dir / self.split /
-            f"{patient_id}_image.npy"
-        )
+        folder = self.data_dir / self.split
 
-        label_path = (
-            self.data_dir / self.split /
-            f"{patient_id}_label.npy"
-        )
+        image = np.load(
+            folder / f"{patient_id}_image.npy"
+        ).astype(np.float32)
 
-        image = np.load(image_path).astype(np.float32)
-        label = np.load(label_path).astype(np.int64)
+        label = np.load(
+            folder / f"{patient_id}_label.npy"
+        ).astype(np.int64)
 
         return image, label
 
     def sample_patch(self, image, label):
         _, depth, height, width = image.shape
+        dimensions = (depth, height, width)
 
-        for _ in range(20):
-            if random.random() < 2 / 3 and np.any(label > 0):
-                tumour_voxels = np.argwhere(label > 0)
-                center = tumour_voxels[
-                    random.randrange(len(tumour_voxels))
-                ]
-
-                starts = [
-                    max(0, min(int(center[i]) - PATCH_SIZE // 2,
-                               [depth, height, width][i] - PATCH_SIZE))
-                    for i in range(3)
-                ]
-            else:
-                starts = [
-                    random.randint(0, max(0, dim - PATCH_SIZE))
-                    for dim in (depth, height, width)
-                ]
-
-            d, h, w = starts
-
-            image_patch = image[
-                :, d:d+PATCH_SIZE,
-                h:h+PATCH_SIZE,
-                w:w+PATCH_SIZE
+        if random.random() < 2 / 3 and np.any(label > 0):
+            tumour_voxels = np.argwhere(label > 0)
+            center = tumour_voxels[
+                random.randrange(len(tumour_voxels))
             ]
 
-            label_patch = label[
-                d:d+PATCH_SIZE,
-                h:h+PATCH_SIZE,
-                w:w+PATCH_SIZE
+            starts = [
+                max(
+                    0,
+                    min(
+                        int(center[i]) - PATCH_SIZE // 2,
+                        dimensions[i] - PATCH_SIZE
+                    )
+                )
+                for i in range(3)
+            ]
+        else:
+            starts = [
+                random.randint(0, dimensions[i] - PATCH_SIZE)
+                for i in range(3)
             ]
 
-            if image_patch.shape[1:] == (
-                PATCH_SIZE, PATCH_SIZE, PATCH_SIZE
-            ):
-                return image_patch, label_patch
+        d, h, w = starts
 
-        raise RuntimeError("Could not sample a valid patch")
+        image_patch = image[
+            :, d:d+PATCH_SIZE,
+            h:h+PATCH_SIZE,
+            w:w+PATCH_SIZE
+        ]
+
+        label_patch = label[
+            d:d+PATCH_SIZE,
+            h:h+PATCH_SIZE,
+            w:w+PATCH_SIZE
+        ]
+
+        return image_patch, label_patch
 
     def augment(self, image, label):
         for axis in (1, 2, 3):
             if random.random() < 0.5:
                 image = np.flip(image, axis=axis).copy()
-                label = np.flip(label, axis=axis - 1).copy()
+                label = np.flip(label, axis=axis-1).copy()
 
         if random.random() < 0.5:
-            scale = random.uniform(0.9, 1.1)
-            shift = random.uniform(-0.1, 0.1)
-            image = image * scale + shift
+            image = (
+                image * random.uniform(0.9, 1.1)
+                + random.uniform(-0.1, 0.1)
+            )
 
         if random.random() < 0.3:
             noise = np.random.normal(
@@ -163,13 +161,74 @@ def build_model(model_type):
     )
 
 
+def dice_score(prediction, target):
+    prediction = prediction.bool()
+    target = target.bool()
+
+    intersection = (prediction & target).sum().item()
+    denominator = prediction.sum().item() + target.sum().item()
+
+    if denominator == 0:
+        return 1.0
+
+    return 2.0 * intersection / denominator
+
+
+def validate(model, loader, device):
+    model.eval()
+
+    wt_scores = []
+    tc_scores = []
+
+    with torch.inference_mode():
+        for images, labels in loader:
+            # Full volumes remain on CPU.
+            # Sliding-window patches are processed on GPU.
+            outputs = sliding_window_inference(
+                inputs=images,
+                roi_size=(96, 96, 96),
+                sw_batch_size=1,
+                predictor=model,
+                overlap=0.25,
+                mode="gaussian",
+                sw_device=device,
+                device="cpu"
+            )
+
+            predictions = outputs.argmax(dim=1)[0]
+            target = labels[0]
+
+            pred_wt = predictions > 0
+            true_wt = target > 0
+
+            pred_tc = (
+                (predictions == 1) | (predictions == 3)
+            )
+            true_tc = (
+                (target == 1) | (target == 3)
+            )
+
+            wt_scores.append(dice_score(pred_wt, true_wt))
+            tc_scores.append(dice_score(pred_tc, true_tc))
+
+    wt_mean = float(np.mean(wt_scores))
+    tc_mean = float(np.mean(tc_scores))
+    mean_dice = (wt_mean + tc_mean) / 2
+
+    return wt_mean, tc_mean, mean_dice
+
+
 def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--manifest", required=True)
-    parser.add_argument("--data-dir", default="data/preprocessed")
-    parser.add_argument("--model", choices=["A", "B"], required=True)
-    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument(
+        "--data-dir", default="data/preprocessed"
+    )
+    parser.add_argument(
+        "--model", choices=["A", "B"], required=True
+    )
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--output-dir", default="checkpoints")
 
     args = parser.parse_args()
@@ -182,12 +241,16 @@ def main():
 
     print("Device:", device)
     print("Model:", args.model)
-    print("Seed:", SEED)
+    print("Random seed:", SEED)
 
     manifest = pd.read_csv(args.manifest)
 
     train_dataset = BrainTumourDataset(
         manifest, args.data_dir, "train", args.model
+    )
+
+    val_dataset = BrainTumourDataset(
+        manifest, args.data_dir, "validation", args.model
     )
 
     train_loader = DataLoader(
@@ -197,18 +260,32 @@ def main():
         num_workers=0
     )
 
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0
+    )
+
     model = build_model(args.model).to(device)
 
     if args.model == "A":
         criterion = torch.nn.CrossEntropyLoss()
+
         optimizer = torch.optim.Adam(
-            model.parameters(), lr=LEARNING_RATE
+            model.parameters(),
+            lr=LEARNING_RATE
         )
+
+        scheduler = None
+
     else:
         criterion = DiceCELoss(
             include_background=False,
             to_onehot_y=True,
-            softmax=True
+            softmax=True,
+            lambda_dice=1.0,
+            lambda_ce=1.0
         )
 
         optimizer = torch.optim.Adam(
@@ -217,10 +294,19 @@ def main():
             weight_decay=1e-5
         )
 
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=0.5,
+            patience=5,
+            min_lr=1e-6
+        )
+
     output_dir = Path(args.output_dir) / f"model_{args.model}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     history = []
+    best_mean_dice = -1.0
 
     for epoch in range(args.epochs):
         start = time.time()
@@ -231,10 +317,7 @@ def main():
             images = images.to(device)
             labels = labels.to(device)
 
-            if args.model == "A":
-                labels = labels
-
-            else:
+            if args.model == "B":
                 labels = labels.unsqueeze(1)
 
             optimizer.zero_grad(set_to_none=True)
@@ -248,17 +331,36 @@ def main():
             total_loss += loss.item()
 
         average_loss = total_loss / len(train_loader)
-        epoch_time = time.time() - start
 
-        history.append({
+        wt_dice, tc_dice, mean_dice = validate(
+            model, val_loader, device
+        )
+
+        if scheduler is not None:
+            scheduler.step(mean_dice)
+
+        epoch_time = time.time() - start
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        record = {
             "epoch": epoch + 1,
             "train_loss": average_loss,
+            "val_WT_Dice": wt_dice,
+            "val_TC_Dice": tc_dice,
+            "val_mean_Dice": mean_dice,
+            "learning_rate": current_lr,
             "epoch_time_seconds": epoch_time
-        })
+        }
+
+        history.append(record)
 
         print(
             f"Epoch {epoch+1}/{args.epochs} | "
             f"Loss: {average_loss:.4f} | "
+            f"WT: {wt_dice:.4f} | "
+            f"TC: {tc_dice:.4f} | "
+            f"Mean: {mean_dice:.4f} | "
+            f"LR: {current_lr:.2e} | "
             f"Time: {epoch_time:.1f}s"
         )
 
@@ -267,24 +369,29 @@ def main():
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "train_loss": average_loss,
+            "val_WT_Dice": wt_dice,
+            "val_TC_Dice": tc_dice,
+            "val_mean_Dice": mean_dice,
+            "history": history,
             "seed": SEED,
             "model_type": args.model
         }
 
         torch.save(checkpoint, output_dir / "latest.pth")
 
+        if mean_dice > best_mean_dice:
+            best_mean_dice = mean_dice
+            torch.save(checkpoint, output_dir / "best.pth")
+            print("Best checkpoint updated.")
+
         pd.DataFrame(history).to_csv(
             output_dir / "training_history.csv",
             index=False
         )
 
-    torch.save(
-        checkpoint,
-        output_dir / "final.pth"
-    )
-
     print("\nTraining completed.")
-    print("Checkpoints:", output_dir)
+    print("Best validation mean Dice:", best_mean_dice)
+    print("Checkpoints saved in:", output_dir)
 
 
 if __name__ == "__main__":

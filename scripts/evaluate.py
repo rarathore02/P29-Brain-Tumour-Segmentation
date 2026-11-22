@@ -176,7 +176,12 @@ def main():
     with torch.inference_mode():
         for images, labels, patient_ids, original_shapes in loader:
             patient_id = patient_ids[0]
-            original_shape = original_shapes
+
+            # DataLoader batches each dimension into a one-element tensor.
+            # Convert them to ordinary Python integers before slicing.
+            original_shape = tuple(
+                int(shape[0].item()) for shape in original_shapes
+            )
 
             start = time.time()
 

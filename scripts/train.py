@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from monai.networks.nets import UNet
@@ -30,6 +31,38 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+def pad_volume(image, label):
+    _, depth, height, width = image.shape
+
+    pad_d = max(0, PATCH_SIZE - depth)
+    pad_h = max(0, PATCH_SIZE - height)
+    pad_w = max(0, PATCH_SIZE - width)
+
+    if pad_d or pad_h or pad_w:
+        image = np.pad(
+            image,
+            (
+                (0, 0),
+                (0, pad_d),
+                (0, pad_h),
+                (0, pad_w)
+            ),
+            mode="constant"
+        )
+
+        label = np.pad(
+            label,
+            (
+                (0, pad_d),
+                (0, pad_h),
+                (0, pad_w)
+            ),
+            mode="constant"
+        )
+
+    return image, label
+
+
 class BrainTumourDataset(Dataset):
     def __init__(self, manifest, data_dir, split, model_type):
         self.data_dir = Path(data_dir)
@@ -43,6 +76,7 @@ class BrainTumourDataset(Dataset):
     def __len__(self):
         if self.split == "train":
             return len(self.patients) * PATCHES_PER_PATIENT
+
         return len(self.patients)
 
     def load_patient(self, patient_id):
@@ -56,7 +90,7 @@ class BrainTumourDataset(Dataset):
             folder / f"{patient_id}_label.npy"
         ).astype(np.int64)
 
-        return image, label
+        return pad_volume(image, label)
 
     def sample_patch(self, image, label):
         _, depth, height, width = image.shape
@@ -64,6 +98,7 @@ class BrainTumourDataset(Dataset):
 
         if random.random() < 2 / 3 and np.any(label > 0):
             tumour_voxels = np.argwhere(label > 0)
+
             center = tumour_voxels[
                 random.randrange(len(tumour_voxels))
             ]
@@ -78,6 +113,7 @@ class BrainTumourDataset(Dataset):
                 )
                 for i in range(3)
             ]
+
         else:
             starts = [
                 random.randint(0, dimensions[i] - PATCH_SIZE)
@@ -87,15 +123,15 @@ class BrainTumourDataset(Dataset):
         d, h, w = starts
 
         image_patch = image[
-            :, d:d+PATCH_SIZE,
-            h:h+PATCH_SIZE,
-            w:w+PATCH_SIZE
+            :, d:d + PATCH_SIZE,
+            h:h + PATCH_SIZE,
+            w:w + PATCH_SIZE
         ]
 
         label_patch = label[
-            d:d+PATCH_SIZE,
-            h:h+PATCH_SIZE,
-            w:w+PATCH_SIZE
+            d:d + PATCH_SIZE,
+            h:h + PATCH_SIZE,
+            w:w + PATCH_SIZE
         ]
 
         return image_patch, label_patch
@@ -104,7 +140,7 @@ class BrainTumourDataset(Dataset):
         for axis in (1, 2, 3):
             if random.random() < 0.5:
                 image = np.flip(image, axis=axis).copy()
-                label = np.flip(label, axis=axis-1).copy()
+                label = np.flip(label, axis=axis - 1).copy()
 
         if random.random() < 0.5:
             image = (
@@ -116,6 +152,7 @@ class BrainTumourDataset(Dataset):
             noise = np.random.normal(
                 0, 0.05, image.shape
             ).astype(np.float32)
+
             image = image + noise
 
         return image, label
@@ -182,8 +219,8 @@ def validate(model, loader, device):
 
     with torch.inference_mode():
         for images, labels in loader:
-            # Full volumes remain on CPU.
-            # Sliding-window patches are processed on GPU.
+            original_shape = labels.shape[-3:]
+
             outputs = sliding_window_inference(
                 inputs=images,
                 roi_size=(96, 96, 96),
@@ -195,6 +232,15 @@ def validate(model, loader, device):
                 device="cpu"
             )
 
+            # Remove padding before calculating metrics.
+            outputs = outputs[
+                :,
+                :,
+                :original_shape[0],
+                :original_shape[1],
+                :original_shape[2]
+            ]
+
             predictions = outputs.argmax(dim=1)[0]
             target = labels[0]
 
@@ -204,6 +250,7 @@ def validate(model, loader, device):
             pred_tc = (
                 (predictions == 1) | (predictions == 3)
             )
+
             true_tc = (
                 (target == 1) | (target == 3)
             )
@@ -213,21 +260,16 @@ def validate(model, loader, device):
 
     wt_mean = float(np.mean(wt_scores))
     tc_mean = float(np.mean(tc_scores))
-    mean_dice = (wt_mean + tc_mean) / 2
 
-    return wt_mean, tc_mean, mean_dice
+    return wt_mean, tc_mean, (wt_mean + tc_mean) / 2
 
 
 def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--manifest", required=True)
-    parser.add_argument(
-        "--data-dir", default="data/preprocessed"
-    )
-    parser.add_argument(
-        "--model", choices=["A", "B"], required=True
-    )
+    parser.add_argument("--data-dir", default="data/preprocessed")
+    parser.add_argument("--model", choices=["A", "B"], required=True)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--output-dir", default="checkpoints")
 
@@ -355,7 +397,7 @@ def main():
         history.append(record)
 
         print(
-            f"Epoch {epoch+1}/{args.epochs} | "
+            f"Epoch {epoch + 1}/{args.epochs} | "
             f"Loss: {average_loss:.4f} | "
             f"WT: {wt_dice:.4f} | "
             f"TC: {tc_dice:.4f} | "
